@@ -1,4 +1,5 @@
-from typing import Literal, Dict, List, Optional, Callable
+from typing import Literal, Dict, List, Optional, Callable, Tuple
+from collections import defaultdict
 from tqdm import tqdm, trange
 import numpy as np
 import os
@@ -609,3 +610,241 @@ def save_seperate_videos(
             logger.info(f"saved video to {tmp_save_pth}")
     del render_results
     return return_frame_dict
+
+
+def _compose_key_frame(
+    ts_data: Dict,
+    key: str,
+    cam_names: List[str],
+    layout: Callable,
+) -> Optional[np.ndarray]:
+    """Compose a layout image for one key at one timestamp. Returns None if key has no data."""
+    if "mask" in key:
+        lookup_key = key.replace("mask", "opacities")
+        if not ts_data.get(lookup_key):
+            return None
+        frames = [np.stack([f, f, f], axis=-1) for f in ts_data[lookup_key]]
+    elif key == "gt_sky_masks":
+        if not ts_data.get(key):
+            return None
+        frames = [np.stack([f, f, f], axis=-1) for f in ts_data[key]]
+    elif "depth" in key:
+        if not ts_data.get(key):
+            return None
+        opacity_key = key.replace("depths", "opacities")
+        if not ts_data.get(opacity_key):
+            return None
+        frames = [depth_visualizer(f, op) for f, op in zip(ts_data[key], ts_data[opacity_key])]
+    else:
+        if not ts_data.get(key):
+            return None
+        frames = ts_data[key]
+    return layout(frames, cam_names)
+
+
+def render_and_save_videos(
+    trainer: BasicTrainer,
+    dataset: SplitWrapper,
+    video_output_pth: str,
+    layout: Callable,
+    num_timestamps: int,
+    num_cams: int,
+    keys: List[str],
+    compute_metrics: bool = False,
+    compute_error_map: bool = False,
+    save_seperate_video: bool = False,
+    fps: int = 10,
+    verbose: bool = True,
+) -> Tuple[Dict, Dict]:
+    """
+    Stream-render a dataset and write video frames immediately, one timestamp at a time.
+    Memory usage is O(num_cams) instead of O(total_frames).
+
+    Returns:
+        metrics_dict: scalar metrics (psnr, ssim, lpips, etc.)
+        vis_frame_dict: one representative frame for logging
+    """
+    trainer.set_eval()
+    camera_downscale = trainer._get_downscale_factor()
+    return_frame_id = num_timestamps // 2
+    return_frame_dict = {}
+
+    # --- metrics accumulators ---
+    psnrs, ssim_scores, lpipss = [], [], []
+    masked_psnrs, masked_ssims = [], []
+    human_psnrs, human_ssims = [], []
+    vehicle_psnrs, vehicle_ssims = [], []
+    occupied_psnrs, occupied_ssims = [], []
+
+    # --- open writers ---
+    def _make_writer(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return imageio.get_writer(path, mode="I") if num_timestamps == 1 \
+            else imageio.get_writer(path, mode="I", fps=fps)
+
+    if save_seperate_video:
+        writers = {
+            key: _make_writer(video_output_pth.replace(".mp4", f"_{key}.mp4"))
+            for key in keys
+        }
+    else:
+        writer = _make_writer(video_output_pth)
+
+    green_background = torch.tensor([0.0, 177, 64]) / 255.0
+
+    with torch.no_grad():
+        for ts in trange(num_timestamps, desc=f"rendering {dataset.split}", dynamic_ncols=True):
+            ts_data = defaultdict(list)
+
+            for cam_idx in range(num_cams):
+                i = ts * num_cams + cam_idx
+                image_infos, cam_infos = dataset.get_image(i, camera_downscale)
+                for k, v in image_infos.items():
+                    if isinstance(v, Tensor):
+                        image_infos[k] = v.cuda(non_blocking=True)
+                for k, v in cam_infos.items():
+                    if isinstance(v, Tensor):
+                        cam_infos[k] = v.cuda(non_blocking=True)
+
+                results = trainer(image_infos, cam_infos)
+                for k, v in results.items():
+                    if isinstance(v, Tensor) and "rgb" in k:
+                        results[k] = v.clamp(0., 1.)
+
+                gb = green_background.to(results["rgb"].device)
+                rgb = results["rgb"]
+
+                ts_data["cam_names"].append(cam_infos["cam_name"])
+                ts_data["rgbs"].append(get_numpy(rgb))
+                if "pixels" in image_infos:
+                    ts_data["gt_rgbs"].append(get_numpy(image_infos["pixels"]))
+                ts_data["depths"].append(get_numpy(results["depth"]))
+                if "opacity" in results:
+                    ts_data["opacities"].append(get_numpy(results["opacity"]))
+
+                for component in ("Background", "RigidNodes", "DeformableNodes", "SMPLNodes", "Dynamic"):
+                    rgb_key = f"{component}_rgb"
+                    if rgb_key in results:
+                        opacity_key = f"{component}_opacity"
+                        comp_rgb = results[rgb_key] * results[opacity_key] + gb * (1 - results[opacity_key])
+                        ts_data[f"{component}_rgbs"].append(get_numpy(comp_rgb))
+                    depth_key = f"{component}_depth"
+                    if depth_key in results:
+                        ts_data[f"{component}_depths"].append(get_numpy(results[depth_key]))
+                        ts_data[f"{component}_opacities"].append(get_numpy(results[f"{component}_opacity"]))
+
+                if compute_error_map and "pixels" in image_infos:
+                    error_map = (rgb - image_infos["pixels"]) ** 2
+                    error_map = error_map.mean(dim=-1, keepdim=True)
+                    error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
+                    error_map = error_map.repeat_interleave(3, dim=-1)
+                    ts_data["rgb_error_maps"].append(get_numpy(error_map))
+
+                if "rgb_sky_blend" in results:
+                    ts_data["rgb_sky_blend"].append(get_numpy(results["rgb_sky_blend"]))
+                if "rgb_sky" in results:
+                    ts_data["rgb_sky"].append(get_numpy(results["rgb_sky"]))
+                if "sky_masks" in image_infos:
+                    ts_data["gt_sky_masks"].append(get_numpy(image_infos["sky_masks"]))
+                if "lidar_depth_map" in image_infos:
+                    depth_map = image_infos["lidar_depth_map"]
+                    depth_img = depth_map.cpu().numpy()
+                    depth_img = depth_visualizer(depth_img, depth_img > 0)
+                    mask = (depth_map.unsqueeze(-1) > 0).cpu().numpy()
+                    lidar_on_image = image_infos["pixels"].cpu().numpy() * (1 - mask) + depth_img * mask
+                    ts_data["lidar_on_images"].append(lidar_on_image)
+
+                if compute_metrics and "pixels" in image_infos:
+                    psnr = compute_psnr(rgb, image_infos["pixels"])
+                    ssim_score = ssim(
+                        get_numpy(rgb), get_numpy(image_infos["pixels"]),
+                        data_range=1.0, channel_axis=-1,
+                    )
+                    lpips = trainer.lpips(
+                        rgb[None, ...].permute(0, 3, 1, 2),
+                        image_infos["pixels"][None, ...].permute(0, 3, 1, 2),
+                    )
+                    psnrs.append(psnr)
+                    ssim_scores.append(ssim_score)
+                    lpipss.append(lpips.item())
+
+                    if "sky_masks" in image_infos:
+                        occupied_mask = ~get_numpy(image_infos["sky_masks"]).astype(bool)
+                        if occupied_mask.sum() > 0:
+                            occupied_psnrs.append(compute_psnr(rgb[occupied_mask], image_infos["pixels"][occupied_mask]))
+                            occupied_ssims.append(
+                                ssim(get_numpy(rgb), get_numpy(image_infos["pixels"]),
+                                     data_range=1.0, channel_axis=-1, full=True)[1][occupied_mask].mean()
+                            )
+                    if "dynamic_masks" in image_infos:
+                        dynamic_mask = get_numpy(image_infos["dynamic_masks"]).astype(bool)
+                        if dynamic_mask.sum() > 0:
+                            masked_psnrs.append(compute_psnr(rgb[dynamic_mask], image_infos["pixels"][dynamic_mask]))
+                            masked_ssims.append(
+                                ssim(get_numpy(rgb), get_numpy(image_infos["pixels"]),
+                                     data_range=1.0, channel_axis=-1, full=True)[1][dynamic_mask].mean()
+                            )
+                    if "human_masks" in image_infos:
+                        human_mask = get_numpy(image_infos["human_masks"]).astype(bool)
+                        if human_mask.sum() > 0:
+                            human_psnrs.append(compute_psnr(rgb[human_mask], image_infos["pixels"][human_mask]))
+                            human_ssims.append(
+                                ssim(get_numpy(rgb), get_numpy(image_infos["pixels"]),
+                                     data_range=1.0, channel_axis=-1, full=True)[1][human_mask].mean()
+                            )
+                    if "vehicle_masks" in image_infos:
+                        vehicle_mask = get_numpy(image_infos["vehicle_masks"]).astype(bool)
+                        if vehicle_mask.sum() > 0:
+                            vehicle_psnrs.append(compute_psnr(rgb[vehicle_mask], image_infos["pixels"][vehicle_mask]))
+                            vehicle_ssims.append(
+                                ssim(get_numpy(rgb), get_numpy(image_infos["pixels"]),
+                                     data_range=1.0, channel_axis=-1, full=True)[1][vehicle_mask].mean()
+                            )
+
+            # --- write this timestamp's frame(s) ---
+            cam_names = ts_data["cam_names"]
+            if save_seperate_video:
+                for key, w in writers.items():
+                    frame_img = _compose_key_frame(ts_data, key, cam_names, layout)
+                    if frame_img is None:
+                        continue
+                    frame_u8 = to8b(frame_img)
+                    if ts == return_frame_id:
+                        return_frame_dict[key] = frame_u8
+                    w.append_data(frame_u8)
+            else:
+                merged_list = []
+                for key in keys:
+                    frame_img = _compose_key_frame(ts_data, key, cam_names, layout)
+                    if frame_img is not None:
+                        merged_list.append(frame_img)
+                if merged_list:
+                    merged_frame = to8b(np.concatenate(merged_list, axis=0))
+                    if ts == return_frame_id:
+                        return_frame_dict["concatenated_frame"] = merged_frame
+                    writer.append_data(merged_frame)
+
+    # --- close writers ---
+    if save_seperate_video:
+        for w in writers.values():
+            w.close()
+    else:
+        writer.close()
+
+    if verbose:
+        logger.info(f"saved video to {video_output_pth}")
+
+    metrics_dict = {
+        "psnr": non_zero_mean(psnrs) if compute_metrics else -1,
+        "ssim": non_zero_mean(ssim_scores) if compute_metrics else -1,
+        "lpips": non_zero_mean(lpipss) if compute_metrics else -1,
+        "occupied_psnr": non_zero_mean(occupied_psnrs) if compute_metrics else -1,
+        "occupied_ssim": non_zero_mean(occupied_ssims) if compute_metrics else -1,
+        "masked_psnr": non_zero_mean(masked_psnrs) if compute_metrics else -1,
+        "masked_ssim": non_zero_mean(masked_ssims) if compute_metrics else -1,
+        "human_psnr": non_zero_mean(human_psnrs) if compute_metrics else -1,
+        "human_ssim": non_zero_mean(human_ssims) if compute_metrics else -1,
+        "vehicle_psnr": non_zero_mean(vehicle_psnrs) if compute_metrics else -1,
+        "vehicle_ssim": non_zero_mean(vehicle_ssims) if compute_metrics else -1,
+    }
+    return metrics_dict, return_frame_dict

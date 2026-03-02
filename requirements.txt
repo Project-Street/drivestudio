@@ -1,9 +1,10 @@
 # PyTorch and related libraries
---extra-index-url https://download.pytorch.org/whl/cu117
-torch==2.0.0+cu117
-torchvision==0.15.0+cu117
-xformers==0.0.18
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+xformers==0.0.22.post7
 timm==0.9.5
+transformers<=4.49
 pytorch_msssim==1.0.0
 
 omegaconf==2.3.0
