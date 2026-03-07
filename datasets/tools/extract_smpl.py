@@ -1,6 +1,7 @@
 import os
 import warnings
 import logging
+import multiprocessing as mp
 from glob import glob
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -180,11 +181,27 @@ def initialize_config(config_name="config"):
     cfg = hydra.compose(config_name=config_name)
     return cfg
 
+def _track_camera_worker(cached_video_path: str, output_dir: str) -> None:
+    """Run PHALP tracking for a single camera. Runs in an isolated subprocess."""
+    from hydra.core.global_hydra import GlobalHydra
+    import torch
+
+    GlobalHydra.instance().clear()
+    cfg = initialize_config()
+    cfg.video.source = cached_video_path
+    cfg.video.output_dir = output_dir
+
+    phalp_tracker = HMR2_4dhuman(cfg)
+    phalp_tracker.track()
+    del phalp_tracker
+    torch.cuda.empty_cache()
+
+
 def run_4DHumans(
     scene_dir: str, camera_list: List[int], save_temp: bool=True, verbose: bool=False, fps: int=12
 ) -> Optional[float]:
     """Main function for running the PHALP tracker.
-    
+
     Args:
         scene_dir: Path to the scene directory containing the images files
         camera_list: List of camera IDs to run the tracker on
@@ -192,97 +209,82 @@ def run_4DHumans(
             recommended to set to True if you have enough disk space
         verbose: Whether to visualize the smpl mesh in video or not
         fps: Frames per second of the input images
-    
+
     Returns:
         pred_tracks_allcam: Dictionary containing the predicted tracks for each camera
     """
-    # make sure the scene directory exists
     assert os.path.exists(scene_dir), f"Scene directory {scene_dir} does not exist"
     images_dir = os.path.join(scene_dir, 'images')
     assert os.path.exists(images_dir), f"Images directory {images_dir} does not exist"
     temp_dir = os.path.join(scene_dir, 'humanpose', 'temp')
-    
-    # create a flag to check if the results already exist
-    already_done = False
+    output_dir = os.path.join(temp_dir, 'phalp_output')
+    os.makedirs(output_dir, exist_ok=True)
+
+    failed_cameras = []
 
     for cam_id in camera_list:
-        results_path = os.path.join(temp_dir, 'phalp_output', f'cam_{cam_id}.pkl')
-        if os.path.exists(results_path):
-            logger.info(f"Results for camera {cam_id} already exists at {results_path}")
-            already_done = True
+        final_path = os.path.join(output_dir, f'cam_{cam_id}.pkl')
+        if os.path.exists(final_path):
+            logger.info(f"Results for camera {cam_id} already exist at {final_path}")
             continue
-        
-        cfg = initialize_config()
-        
+
         cached_video_path = os.path.join(temp_dir, 'raw_videos', f'{cam_id}.mp4')
         if not os.path.exists(cached_video_path):
-            logger.info(f"Cached video not found at {cached_video_path}, we will create it")
+            logger.info(f"Cached video not found at {cached_video_path}, creating it")
             os.makedirs(os.path.dirname(cached_video_path), exist_ok=True)
-            
             image_paths = sorted(glob(os.path.join(images_dir, f"*_{cam_id}.*")))
-            
-            # create video
             height, width = cv2.imread(image_paths[0]).shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(cached_video_path, fourcc, fps, (width, height))
+            vid_writer = cv2.VideoWriter(cached_video_path, fourcc, fps, (width, height))
             for image_path in image_paths:
-                frame = cv2.imread(image_path)
-                out.write(frame)
-            out.release()
-        cfg.video.source = cached_video_path
-        
-        output_dir = os.path.join(temp_dir, 'phalp_output')
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        cfg.video.output_dir = output_dir
+                vid_writer.write(cv2.imread(image_path))
+            vid_writer.release()
 
-        phalp_tracker = HMR2_4dhuman(cfg)
-        phalp_tracker.track()
-        
-        # reset global hydra
-        GlobalHydra.instance().clear()
-    
-    # remove temporary or useless files
-    dirs_to_remove = [
-        os.path.join(temp_dir, 'phalp_output', '_DEMO'),
-        os.path.join(temp_dir, 'phalp_output', '_TMP'),
-        os.path.join(temp_dir, 'phalp_output', 'results_tracks')
-    ]
-    if not save_temp:
-        # remove temporary files
-        dirs_to_remove.append(os.path.join(temp_dir, 'raw_videos'))
-    for d in dirs_to_remove:
+        ctx = mp.get_context('spawn')
+        p = ctx.Process(target=_track_camera_worker, args=(cached_video_path, output_dir))
+        p.start()
+        p.join()
+
+        result_path = os.path.join(output_dir, 'results', f'demo_{cam_id}.pkl')
+        if p.exitcode != 0 or not os.path.exists(result_path):
+            logger.error(f"Tracking for camera {cam_id} failed (exit code: {p.exitcode}), skipping")
+            failed_cameras.append(cam_id)
+            continue
+
+        if save_temp:
+            os.rename(result_path, final_path)
+
+        if not verbose:
+            phalp_video = os.path.join(output_dir, f'PHALP_{cam_id}.mp4')
+            if os.path.exists(phalp_video):
+                os.remove(phalp_video)
+
+    # cleanup temp dirs
+    for d in [
+        os.path.join(output_dir, '_DEMO'),
+        os.path.join(output_dir, '_TMP'),
+        os.path.join(output_dir, 'results_tracks'),
+    ]:
         if os.path.exists(d):
             os.system(f"rm -rf {d}")
-    
-    if not verbose:
-        # remove the video files generated by PHALP
-        files_to_remove = [
-            os.path.join(temp_dir, 'phalp_output', f'PHALP_{i}.mp4') for i in camera_list
-        ]
-        for f in files_to_remove:
-            if os.path.exists(f):
-                os.remove(f)
-    
-    # load those pickle files to return
+
+    if not save_temp:
+        raw_videos_dir = os.path.join(temp_dir, 'raw_videos')
+        if os.path.exists(raw_videos_dir):
+            os.system(f"rm -rf {raw_videos_dir}")
+
+    # load results for successful cameras
     pred_tracks_allcam = {}
-    for i, cam_id in enumerate(camera_list):
-        if already_done:
-            pred_tracks_allcam[cam_id] = joblib.load(
-                os.path.join(temp_dir, 'phalp_output', f'cam_{cam_id}.pkl')
-            )
+    for cam_id in camera_list:
+        if cam_id in failed_cameras:
+            continue
+        final_path = os.path.join(output_dir, f'cam_{cam_id}.pkl')
+        if os.path.exists(final_path):
+            pred_tracks_allcam[cam_id] = joblib.load(final_path)
         else:
-            pred_tracks_allcam[cam_id] = joblib.load(
-                os.path.join(temp_dir, 'phalp_output', 'results', f'demo_{i}.pkl')
-            )
-    
-    # move and rename saved pickle files if save_temp
-    if save_temp and not already_done:
-        for i, cam_id in enumerate(camera_list):
-            os.rename(
-                os.path.join(temp_dir, 'phalp_output', 'results', f'demo_{i}.pkl'),
-                os.path.join(temp_dir, 'phalp_output', f'cam_{cam_id}.pkl')
-            )
-    os.system(f"rm -rf {os.path.join(temp_dir, 'phalp_output', 'results')}")
-    
+            result_path = os.path.join(output_dir, 'results', f'demo_{cam_id}.pkl')
+            pred_tracks_allcam[cam_id] = joblib.load(result_path)
+
+    os.system(f"rm -rf {os.path.join(output_dir, 'results')}")
+
     return pred_tracks_allcam
